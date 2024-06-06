@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 git2 = "0.13"
+ssh2 = "0.9"
+colored = "2.0"
