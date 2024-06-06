@@ -2,23 +2,27 @@ use git2::{Cred, RemoteCallbacks, Repository};
 use std::fs::{OpenOptions, File};
 use std::io::{self, Write};
 use std::path::Path;
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::thread;
 use colored::*;
 
 fn main() {
     let repo_path = Path::new(".");
-    let repo = Repository::open(repo_path).expect("Could not open repository");
+    let repo = Arc::new(Mutex::new(Repository::open(repo_path).expect("Could not open repository")));
 
     // Show overview of the current state of the repository
-    let mut revwalk = repo.revwalk().expect("Could not get revwalk");
+    let repo_guard = repo.lock().unwrap();
+    let mut revwalk = repo_guard.revwalk().expect("Could not get revwalk");
     revwalk.push_head().expect("Could not push head");
     let current_commit_count = revwalk.count();
     
     println!("{}", "================== Repository Overview ==================".bold().underline());
-    println!("{}: {}", "Current branch".bold(), repo.head().unwrap().shorthand().unwrap_or("unknown"));
+    println!("{}: {}", "Current branch".bold(), repo_guard.head().unwrap().shorthand().unwrap_or("unknown"));
     println!("{}: {}", "Current commit count".bold(), current_commit_count);
     println!("{}", "=========================================================".bold().underline());
+
+    drop(repo_guard); // Release the lock on the repo_guard
 
     // Ask the user for the total commit count they want to achieve
     println!("{}", "Enter the total commit count you want to achieve in this run:".bold().blue());
@@ -37,104 +41,140 @@ fn main() {
     }
 
     let readme_path = repo_path.join("README.md");
-    let mut commit_count = current_commit_count + 1;
+    let commit_count = Arc::new(Mutex::new(current_commit_count + 1));
+    let goal_total_commits = Arc::new(goal_total_commits);
+    let repo = Arc::clone(&repo);
 
-    let spinner_chars = vec!['|', '/', '-', '\\'];
-    let mut spinner_index = 0;
-
-    while commit_count <= goal_total_commits {
-        // Append 10 slashes to README.md and commit each addition
-        for _ in 0..10 {
-            if commit_count > goal_total_commits {
-                break;
+    let writer_thread = {
+        let readme_path = readme_path.clone();
+        let commit_count = Arc::clone(&commit_count);
+        let goal_total_commits = Arc::clone(&goal_total_commits);
+        let repo = Arc::clone(&repo);
+    
+        thread::spawn(move || {
+            while *commit_count.lock().unwrap() <= *goal_total_commits {
+                // Append 10 slashes to README.md
+                for _ in 0..10 {
+                    if *commit_count.lock().unwrap() > *goal_total_commits {
+                        break;
+                    }
+    
+                    let mut readme_file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&readme_path)
+                        .expect("Could not open README.md");
+    
+                    writeln!(readme_file, "/").expect("Could not write to README.md");
+    
+                    let mut repo_guard = repo.lock().unwrap();
+                    let mut index = repo_guard.index().expect("Could not get repository index");
+    
+                    if Path::new("README.md").exists() {
+                        index.add_path(Path::new("README.md")).expect("Could not add file to index");
+                    }
+    
+                    let tree_id = index.write_tree().expect("Could not write tree");
+                    let tree = repo_guard.find_tree(tree_id).expect("Could not find tree");
+    
+                    let parent_commit = repo_guard.head().expect("Could not get head").peel_to_commit().expect("Could not peel to commit");
+    
+                    let sig = repo_guard.signature().expect("Could not get signature");
+                    repo_guard.commit(
+                        Some("HEAD"),
+                        &sig,
+                        &sig,
+                        &format!(
+                            "Commit {}",
+                            *commit_count.lock().unwrap()
+                        ),
+                        &tree,
+                        &[&parent_commit],
+                    )
+                    .expect("Could not commit");
+    
+                    *commit_count.lock().unwrap() += 1;
+                }
+    
+                // Empty the contents of README.md
+                let readme_file = File::create(&readme_path).expect("Could not create README.md");
+                readme_file.set_len(0).expect("Could not truncate README.md");
+    
+                *commit_count.lock().unwrap() += 1;
             }
+        })
+    };
 
-            let mut readme_file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&readme_path)
-                .expect("Could not open README.md");
+    let commit_thread = {
+        let repo = Arc::clone(&repo);
+        let commit_count = Arc::clone(&commit_count);
+        let goal_total_commits = Arc::clone(&goal_total_commits);
 
-            writeln!(readme_file, "/").expect("Could not write to README.md");
+        thread::spawn(move || {
+            while *commit_count.lock().unwrap() <= *goal_total_commits {
+                // Add and commit changes
+                if *commit_count.lock().unwrap() > *goal_total_commits {
+                    break;
+                }
 
-            let mut index = repo.index().expect("Could not get repository index");
-            index.add_path(Path::new("README.md")).expect("Could not add file to index");
-            index.write().expect("Could not write index");
+                let mut repo_guard = repo.lock().unwrap();
+                let mut index = repo_guard.index().expect("Could not get repository index");
 
-            let tree_id = index.write_tree().expect("Could not write tree");
-            let tree = repo.find_tree(tree_id).expect("Could not find tree");
+                if Path::new("README.md").exists() {
+                    index.add_path(Path::new("README.md")).expect("Could not add file to index");
+                }
 
-            let head = repo.head().expect("Could not get head");
-            let parent_commit = head.peel_to_commit().expect("Could not peel to commit");
+                let tree_id = index.write_tree().expect("Could not write tree");
+                let tree = repo_guard.find_tree(tree_id).expect("Could not find tree");
 
-            let sig = repo.signature().expect("Could not get signature");
-            repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!(
-                    "Add '/' character - iteration {} - total commits {}",
-                    commit_count, commit_count
-                ),
-                &tree,
-                &[&parent_commit],
-            )
-            .expect("Could not commit");
+                let parent_commit = repo_guard.head().expect("Could not get head").peel_to_commit().expect("Could not peel to commit");
 
-            commit_count += 1;
+                let sig = repo_guard.signature().expect("Could not get signature");
+                repo_guard.commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &format!(
+                        "Commit {}",
+                        *commit_count.lock().unwrap()
+                    ),
+                    &tree,
+                    &[&parent_commit],
+                )
+                .expect("Could not commit");
 
-            // Update progress
-            print!(
-                "\r{} {}: {}/{}",
-                spinner_chars[spinner_index].to_string().cyan(),
-                "Progress".bold().green(),
-                commit_count,
-                goal_total_commits
-            );
-            io::stdout().flush().unwrap();
-            spinner_index = (spinner_index + 1) % spinner_chars.len();
-            thread::sleep(Duration::from_millis(100));
-        }
+                *commit_count.lock().unwrap() += 1;
+            }
+        })
+    };
 
-        // Empty the contents of README.md and commit
-        let readme_file = File::create(&readme_path).expect("Could not create README.md");
-        readme_file.set_len(0).expect("Could not truncate README.md");
+    let progress_thread = {
+        let commit_count = Arc::clone(&commit_count);
+        let goal_total_commits = Arc::clone(&goal_total_commits);
+    
+        thread::spawn(move || {
+            let spinner_chars = vec!['|', '/', '-', '\\'];
+            let mut spinner_index = 0;
+    
+            while *commit_count.lock().unwrap() <= *goal_total_commits {
+                let count = *commit_count.lock().unwrap();
+                print!(
+                    "\r{} {}: {}/{}",
+                    spinner_chars[spinner_index].to_string().cyan(),
+                    "Progress".bold().green(),
+                    count,
+                    *goal_total_commits
+                );
+                io::stdout().flush().unwrap();
+                spinner_index = (spinner_index + 1) % spinner_chars.len();
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
 
-        let mut index = repo.index().expect("Could not get repository index");
-        index.add_path(Path::new("README.md")).expect("Could not add file to index");
-        index.write().expect("Could not write index");
-
-        let tree_id = index.write_tree().expect("Could not write tree");
-        let tree = repo.find_tree(tree_id).expect("Could not find tree");
-
-        let head = repo.head().expect("Could not get head");
-        let parent_commit = head.peel_to_commit().expect("Could not peel to commit");
-
-        let sig = repo.signature().expect("Could not get signature");
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            &format!("Empty file - total commits {}", commit_count),
-            &tree,
-            &[&parent_commit],
-        )
-        .expect("Could not commit");
-
-        commit_count += 1;
-
-        // Update progress
-        print!(
-            "\r{} {}: {}/{}",
-            spinner_chars[spinner_index].to_string().cyan(),
-            "Progress".bold().green(),
-            commit_count,
-            goal_total_commits
-        );
-        io::stdout().flush().unwrap();
-        spinner_index = (spinner_index + 1) % spinner_chars.len();
-        thread::sleep(Duration::from_millis(100));
-    }
+    writer_thread.join().expect("Writer thread panicked");
+    commit_thread.join().expect("Commit thread panicked");
+    progress_thread.join().expect("Progress thread panicked");
 
     // Set up authentication callback for push
     let mut callbacks = RemoteCallbacks::new();
@@ -147,7 +187,8 @@ fn main() {
         )
     });
 
-    let mut remote = repo.find_remote("origin").expect("Could not find remote");
+    let repo_guard = repo.lock().unwrap();
+    let mut remote = repo_guard.find_remote("origin").expect("Could not find remote");
     let mut push_options = git2::PushOptions::new();
     push_options.remote_callbacks(callbacks);
 
@@ -158,6 +199,6 @@ fn main() {
     println!(
         "\n{}: Completed {} iterations and pushed to remote repository.",
         "Success".bold().green(),
-        goal_total_commits - current_commit_count
+        *goal_total_commits - current_commit_count
     );
 }
